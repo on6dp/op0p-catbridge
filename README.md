@@ -5,6 +5,11 @@ Local CAT bridge for the [cluster.op0p.be](https://cluster.op0p.be) DX cluster
 browser, or from a phone/tablet on the same WiFi network - and have your
 transceiver tune to it automatically, via Hamlib/rigctld.
 
+## User guide
+
+📘 Printable step-by-step guide (PDF), for anyone with no IT background:
+[Guide_Tune_your_radio_with_one_click.pdf](Guide_Tune_your_radio_with_one_click.pdf)
+
 ## Downloads
 
 See [cluster.op0p.be/releases](https://cluster.op0p.be/releases) for ready-to-use
