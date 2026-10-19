@@ -1,4 +1,4 @@
-# op0p_catbridge
+# OP0P DXCluster_catbridge
 
 Local CAT bridge for the [cluster.op0p.be](https://cluster.op0p.be) DX cluster
 (OP0P CC-Cluster): lets you click a frequency on the cluster - from a PC
