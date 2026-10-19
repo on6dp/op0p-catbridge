@@ -633,7 +633,7 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
         state["rigs_by_mfg"] = by_mfg
 
         def _apply():
-            mfg_combo["values"] = sorted(by_mfg.keys())
+            mfg_combo["values"] = sorted(by_mfg.keys(), key=str.upper)
             if mfg_var.get() in by_mfg:
                 update_models()
             log("%d modeles Hamlib charges (%d marques)." % (len(rigs), len(by_mfg)))
@@ -641,7 +641,10 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
 
     def update_models(*_args):
         mfg = mfg_var.get()
-        rigs = state["rigs_by_mfg"].get(mfg, [])
+        # Sorted alphabetically (case-insensitive) by model name, so users can
+        # find their exact radio quickly instead of scrolling through Hamlib's
+        # internal ordering (by model id, unrelated to the model name).
+        rigs = sorted(state["rigs_by_mfg"].get(mfg, []), key=lambda r: r["model"].upper())
         labels = ["%s (#%d)" % (r["model"], r["id"]) for r in rigs]
         model_combo["values"] = labels
         if cfg.get("mfg") == mfg and cfg.get("model_label") in labels:
