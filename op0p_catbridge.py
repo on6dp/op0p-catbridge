@@ -96,7 +96,7 @@ Options (toutes facultatives) :
 
 Installer Hamlib (fournit rigctl et rigctld)
 -----------------------------------------------
-    Windows      : https://github.com/Hamlib/Hamlib/releases (archive w32/w64)
+    Windows      : https://github.com/Hamlib/Hamlib/releases/latest (archive w32/w64)
     Debian/Ubuntu: sudo apt install libhamlib-utils
     Fedora       : sudo dnf install hamlib
     macOS        : brew install hamlib
@@ -421,6 +421,24 @@ def find_rigctl_binary():
     return None
 
 
+def get_hamlib_version():
+    """Renvoie une courte chaine decrivant la version de Hamlib installee
+    (ex: "4.5.5"), ou None si elle n'a pas pu etre determinee. Sert juste a
+    l'affichage dans le journal, pour qu'un utilisateur dont la liste de
+    modeles semble incomplete (ex: un tout nouveau poste absent de la
+    liste) comprenne tout de suite qu'il s'agit d'une vieille version de
+    Hamlib a mettre a jour, plutot que d'un bug de ce script."""
+    rigctl_bin = find_rigctl_binary()
+    if not rigctl_bin:
+        return None
+    try:
+        proc = subprocess.run([rigctl_bin, "--version"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r"Hamlib\s+(\d+\.\d+(?:\.\d+)?)", proc.stdout)
+    return m.group(1) if m else None
+
+
 _RIGCTL_LIST_ROW = re.compile(r"^\s*(\d+)\s{2,}")
 
 
@@ -631,12 +649,19 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
         for r in rigs:
             by_mfg.setdefault(r["mfg"], []).append(r)
         state["rigs_by_mfg"] = by_mfg
+        hamlib_version = get_hamlib_version()
 
         def _apply():
             mfg_combo["values"] = sorted(by_mfg.keys(), key=str.upper)
             if mfg_var.get() in by_mfg:
                 update_models()
-            log("%d modeles Hamlib charges (%d marques)." % (len(rigs), len(by_mfg)))
+            if hamlib_version:
+                log("%d modeles Hamlib charges (%d marques) - Hamlib version %s."
+                    % (len(rigs), len(by_mfg), hamlib_version))
+                log("(Si votre radio est tres recente et absente de la liste : "
+                    "mettez Hamlib a jour - github.com/Hamlib/Hamlib/releases/latest)")
+            else:
+                log("%d modeles Hamlib charges (%d marques)." % (len(rigs), len(by_mfg)))
         root.after(0, _apply)
 
     def update_models(*_args):
@@ -648,9 +673,14 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
         labels = ["%s (#%d)" % (r["model"], r["id"]) for r in rigs]
         model_combo["values"] = labels
         if cfg.get("mfg") == mfg and cfg.get("model_label") in labels:
+            # Reprend le modele choisi la derniere fois pour cette marque.
             model_var.set(cfg.get("model_label"))
-        elif labels:
-            model_var.set(labels[0])
+        else:
+            # Ne jamais pre-selectionner un modele au hasard (ex: le premier
+            # par ordre alphabetique) : l'utilisateur doit choisir SON poste
+            # explicitement, sinon il risque de demarrer sans s'en rendre
+            # compte avec un mauvais modele (symptome : "rien ne fonctionne").
+            model_var.set("")
 
     mfg_combo.bind("<<ComboboxSelected>>", update_models)
 
@@ -721,7 +751,7 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
                 "Pont CAT OP0P",
                 "Le programme 'rigctld' (fourni par Hamlib) est introuvable.\n\n"
                 "Installez Hamlib puis reessayez :\n"
-                "  Windows : https://github.com/Hamlib/Hamlib/releases\n"
+                "  Windows : https://github.com/Hamlib/Hamlib/releases/latest\n"
                 "  Debian/Ubuntu : sudo apt install libhamlib-utils\n"
                 "  Fedora : sudo dnf install hamlib\n"
                 "  macOS : brew install hamlib",
