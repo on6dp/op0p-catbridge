@@ -71,6 +71,18 @@ Pre-requis sur votre ordinateur pour ce mode : Python 3.8+ avec tkinter
 s'ouvre pas : `sudo apt install python3-tk`), et Hamlib installe (le
 programme `rigctld` doit etre trouvable - voir plus bas selon votre OS).
 
+Radio deja pilotee par DXLab Suite Commander
+-----------------------------------------------
+Si votre radio est deja reliee a votre PC via DXLab Suite Commander (ex:
+toute la suite DXLab est installee), Commander garde la main sur le port
+serie - inutile (et impossible) que ce script essaie de le prendre aussi.
+Dans ce cas, cochez "Radio deja pilotee par DXLab Suite Commander" dans la
+fenetre (ou utilisez --commander en ligne de commande) : le pont pilotera
+directement Commander via son interface reseau TCP (port par defaut :
+52002 - a activer dans Commander via Configuration > panneau Radio >
+bouton "Net Serv"), sans toucher au port serie. Les champs marque/modele/
+port/vitesse (Hamlib) ne sont alors pas utilises.
+
 Mode avance / ligne de commande (sans fenetre, ex: Raspberry Pi headless)
 ---------------------------------------------------------------------------
 Si vous preferez tout faire a la main (ou si vous lancez ce script sans
@@ -112,6 +124,7 @@ import glob
 import http.cookies
 import http.server
 import json
+import locale
 import os
 import re
 import shutil
@@ -153,6 +166,138 @@ if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
+
+
+COMMANDER_TIMEOUT = 2.0
+
+
+def _adif_field(name, value):
+    """Construit un champ au format ADIF '<nom:longueur>valeur', tel
+    qu'utilise par l'interface reseau TCP de DXLab Suite Commander."""
+    value = str(value)
+    return "<%s:%d>%s" % (name, len(value), value)
+
+
+_ADIF_FIELD_RE = re.compile(r"^<([A-Za-z0-9_]+):(\d+)>")
+
+
+def _parse_adif_field(data):
+    """Extrait le premier champ ADIF en tete de data (<nom:longueur>valeur),
+    tel que renvoye par Commander. Renvoie (nom, valeur) ou (None, None) si
+    data ne commence pas par un champ ADIF reconnaissable."""
+    m = _ADIF_FIELD_RE.match(data)
+    if not m:
+        return None, None
+    name, length = m.group(1), int(m.group(2))
+    return name, data[m.end():m.end() + length]
+
+
+def commander_decimal_point():
+    """Separateur decimal local (ex: ',' en Belgique/France, '.' ailleurs).
+    Le protocole reseau de Commander precise que les frequences envoyees
+    (ecriture) utilisent le separateur decimal local de Windows - on adopte
+    donc celui de cet ordinateur pour construire nos messages, en supposant
+    (cas normal) que Commander tourne sur ce meme PC avec les memes
+    parametres regionaux."""
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+        dp = locale.localeconv().get("decimal_point")
+        return dp if dp else "."
+    except Exception:
+        return "."
+
+
+def commander_send(host, port, command, params=None, expect_reply=False):
+    """Envoie une directive a DXLab Suite Commander via son interface reseau
+    TCP (menu Commander > Configuration > panneau Radio > bouton 'Net Serv',
+    port par defaut : 52002 - base 52000 + 2). Protocole documente dans
+    'Commander TCPIP Messages.pdf' (dxlabsuite.com/commander/) : chaque
+    message est une suite de champs ADIF <nom:longueur>valeur, auto-delimites
+    (pas besoin de caractere de fin de ligne).
+
+    command : nom de la directive Commander (ex: 'CmdSetFreq', 'CmdGetFreq').
+    params  : liste de tuples (nom, valeur) pour les parametres de la
+              directive (aucun pour une commande sans parametre).
+    expect_reply : True pour une commande de lecture (ex: CmdGetFreq), qui
+              renvoie un champ ADIF en reponse. Les commandes d'ecriture
+              (ex: CmdSetFreq) n'en renvoient pas : inutile d'attendre, ca
+              ralentirait chaque clic sur une frequence pour rien.
+
+    Renvoie le texte brut recu ('' si expect_reply est False, ou si rien
+    n'a ete recu a temps)."""
+    params_str = "".join(_adif_field(n, v) for n, v in (params or []))
+    msg = _adif_field("command", command) + _adif_field("parameters", params_str)
+    with socket.create_connection((host, port), timeout=COMMANDER_TIMEOUT) as sock:
+        sock.sendall(msg.encode("ascii"))
+        if not expect_reply:
+            return ""
+        sock.settimeout(COMMANDER_TIMEOUT)
+        data = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                break  # une reponse Commander tient en un seul champ ADIF
+        except socket.timeout:
+            pass
+    return data.decode("ascii", errors="replace")
+
+
+def commander_set_freq(host, port, freq_hz):
+    """Regle la frequence RX via Commander (equivalent du 'F <hz>' envoye a
+    rigctld dans le mode Hamlib normal). Commander attend la frequence en
+    kHz, en texte. Pas de partie decimale quand la frequence tombe juste sur
+    un kHz (cas le plus frequent et le plus sur, quelle que soit la locale) ;
+    sinon 3 decimales avec le separateur decimal local de cet ordinateur."""
+    freq_khz = freq_hz / 1000.0
+    if freq_hz % 1000 == 0:
+        freq_khz_str = str(int(freq_khz))
+    else:
+        freq_khz_str = "%.3f" % freq_khz
+        sep = commander_decimal_point()
+        if sep != ".":
+            freq_khz_str = freq_khz_str.replace(".", sep)
+    commander_send(host, port, "CmdSetFreq", [("xcvrfreq", freq_khz_str)])
+
+
+def commander_get_freq(host, port):
+    """Lit la frequence RX actuelle via Commander (CmdGetFreq - ce champ-la,
+    contrairement a CmdSendFreq, utilise toujours virgule/point comme
+    separateurs de milliers/decimales, quelle que soit la locale - donc
+    facile a analyser ici). Renvoie la frequence en Hz (int), ou None si
+    Commander n'a pas encore de frequence a rapporter ou n'a pas repondu a
+    temps."""
+    reply = commander_send(host, port, "CmdGetFreq", expect_reply=True)
+    name, value = _parse_adif_field(reply)
+    if name != "CmdFreq" or not value:
+        return None
+    value = value.replace(",", "")
+    try:
+        return int(round(float(value) * 1000))
+    except ValueError:
+        return None
+
+
+def parse_commander_addr(addr):
+    """Analyse le champ 'hote:port' saisi pour DXLab Commander. Renvoie
+    (hote, port). Port par defaut : 52002 (= base 52000 + 2, voir le bouton
+    'Net Serv' dans Commander). Leve ValueError si le port saisi n'est pas
+    un nombre."""
+    addr = (addr or "").strip()
+    if not addr:
+        return "127.0.0.1", 52002
+    if ":" in addr:
+        host, _, port_s = addr.rpartition(":")
+        host = host.strip() or "127.0.0.1"
+        try:
+            return host, int(port_s.strip())
+        except ValueError:
+            raise ValueError(
+                "Le port de l'adresse Commander doit etre un nombre (ex: 127.0.0.1:52002)."
+            )
+    return addr, 52002
 
 
 def rigctld_command(host, port, command):
@@ -282,20 +427,30 @@ class CatBridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "freq_khz invalide"}, status=400)
             return
         try:
-            reply = rigctld_command(self.server.rigctld_host, self.server.rigctld_port,
-                                     "F %d" % freq_hz)
-            ok = ("RPRT 0" in reply) or (reply == "")
-            self._send_json({"ok": ok, "freq_hz": freq_hz, "rigctld_reply": reply})
+            if self.server.commander:
+                commander_set_freq(self.server.commander_host, self.server.commander_port, freq_hz)
+                self._send_json({"ok": True, "freq_hz": freq_hz})
+            else:
+                reply = rigctld_command(self.server.rigctld_host, self.server.rigctld_port,
+                                         "F %d" % freq_hz)
+                ok = ("RPRT 0" in reply) or (reply == "")
+                self._send_json({"ok": ok, "freq_hz": freq_hz, "rigctld_reply": reply})
         except OSError as e:
-            self._send_json({"ok": False, "error": "rigctld injoignable: %s" % e}, status=502)
+            target = "DXLab Commander" if self.server.commander else "rigctld"
+            self._send_json({"ok": False, "error": "%s injoignable: %s" % (target, e)}, status=502)
 
     def _handle_status(self):
         try:
-            reply = rigctld_command(self.server.rigctld_host, self.server.rigctld_port, "f")
-            freq_hz = int(reply.splitlines()[0]) if reply.splitlines() and reply.splitlines()[0].lstrip("-").isdigit() else None
-            self._send_json({"ok": True, "freq_hz": freq_hz})
+            if self.server.commander:
+                freq_hz = commander_get_freq(self.server.commander_host, self.server.commander_port)
+                self._send_json({"ok": True, "freq_hz": freq_hz})
+            else:
+                reply = rigctld_command(self.server.rigctld_host, self.server.rigctld_port, "f")
+                freq_hz = int(reply.splitlines()[0]) if reply.splitlines() and reply.splitlines()[0].lstrip("-").isdigit() else None
+                self._send_json({"ok": True, "freq_hz": freq_hz})
         except OSError as e:
-            self._send_json({"ok": False, "error": "rigctld injoignable: %s" % e}, status=502)
+            target = "DXLab Commander" if self.server.commander else "rigctld"
+            self._send_json({"ok": False, "error": "%s injoignable: %s" % (target, e)}, status=502)
 
     # ---- proxy generique vers le site cluster ----
 
@@ -379,12 +534,20 @@ class CatBridgeHandler(http.server.BaseHTTPRequestHandler):
 class CatBridgeServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, upstream, rigctld_host, rigctld_port, pin=None):
+    def __init__(self, addr, upstream, rigctld_host, rigctld_port, pin=None,
+                 commander=False, commander_host="127.0.0.1", commander_port=52002):
         super().__init__(addr, CatBridgeHandler)
         self.upstream = upstream.rstrip("/")
         self.pin = (pin or "").strip() or None
         self.rigctld_host = rigctld_host
         self.rigctld_port = rigctld_port
+        # Mode DXLab Suite Commander (radio deja pilotee par Commander, ex:
+        # suite DXLab complete) : au lieu de passer par Hamlib/rigctld (qui
+        # exigerait de prendre le port serie, deja occupe par Commander), le
+        # pont pilote Commander lui-meme via son interface reseau TCP.
+        self.commander = commander
+        self.commander_host = commander_host
+        self.commander_port = commander_port
 
 
 # =====================================================================
@@ -561,7 +724,7 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
 
     root = tk.Tk()  # leve TclError ici si aucun affichage disponible
     root.title("Pont CAT OP0P - cluster.op0p.be")
-    root.geometry("560x540")
+    root.geometry("560x600")
 
     state = {
         "rigctld_proc": None,
@@ -586,7 +749,8 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
 
     ttk.Label(frm, text="   (ou numero de modele Hamlib manuel :)").grid(row=2, column=0, sticky="w")
     manual_id_var = tk.StringVar(value="")
-    ttk.Entry(frm, textvariable=manual_id_var, width=10).grid(row=2, column=1, sticky="w")
+    manual_id_entry = ttk.Entry(frm, textvariable=manual_id_var, width=10)
+    manual_id_entry.grid(row=2, column=1, sticky="w")
 
     ttk.Label(frm, text="3. Port serie / COM :").grid(row=3, column=0, sticky="w", pady=2)
     port_var = tk.StringVar(value=cfg.get("port", ""))
@@ -600,6 +764,38 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
     baud_combo.grid(row=4, column=1, sticky="ew", pady=2)
 
     frm.columnconfigure(1, weight=1)
+
+    # DXLab Suite Commander : pour une radio deja pilotee par ce logiciel
+    # (le cas typique : toute la suite DXLab est installee et Commander a
+    # deja la main sur le port serie), le pont ne doit PAS essayer de
+    # prendre ce port lui-meme - il pilote plutot Commander via son
+    # interface reseau TCP (Commander > Configuration > panneau Radio >
+    # bouton "Net Serv" ; port par defaut : 52002). Quand cette case est
+    # cochee, les champs 1-4 ci-dessus (Hamlib) sont ignores et rigctld
+    # n'est pas lance du tout.
+    commander_var = tk.BooleanVar(value=bool(cfg.get("commander", False)))
+    commander_addr_var = tk.StringVar(value=cfg.get("commander_addr", "127.0.0.1:52002"))
+
+    def _update_commander_state(*_args):
+        using_commander = commander_var.get()
+        hamlib_state = "disabled" if using_commander else "readonly"
+        mfg_combo.configure(state=hamlib_state)
+        model_combo.configure(state=hamlib_state)
+        manual_id_entry.configure(state=("disabled" if using_commander else "normal"))
+        port_combo.configure(state=("disabled" if using_commander else "normal"))
+        baud_combo.configure(state=("disabled" if using_commander else "normal"))
+        commander_addr_entry.configure(state=("normal" if using_commander else "disabled"))
+
+    ttk.Checkbutton(
+        frm, text="6. Radio deja pilotee par DXLab Suite Commander (pas de port COM direct)",
+        variable=commander_var, command=_update_commander_state,
+    ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+    ttk.Label(
+        frm, text="   Adresse Commander (hote:port, voir bouton \"Net Serv\" dans Commander) :"
+    ).grid(row=8, column=0, sticky="w", pady=(0, 2))
+    commander_addr_entry = ttk.Entry(frm, textvariable=commander_addr_var, width=20, state="disabled")
+    commander_addr_entry.grid(row=8, column=1, sticky="w", pady=(0, 2))
 
     # 5. Reseau local : expose le pont a tout le WiFi/reseau maison (pas
     # seulement ce PC), pour pouvoir cliquer une frequence depuis un
@@ -620,11 +816,11 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
 
     status_var = tk.StringVar(value="Pret.")
     status_lbl = ttk.Label(frm, textvariable=status_var, foreground="#444")
-    status_lbl.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 2))
+    status_lbl.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
     log_box = scrolledtext.ScrolledText(frm, height=14, state="disabled", font=("Courier", 9))
-    log_box.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(4, 8))
-    frm.rowconfigure(9, weight=1)
+    log_box.grid(row=11, column=0, columnspan=2, sticky="nsew", pady=(4, 8))
+    frm.rowconfigure(11, weight=1)
 
     def log(msg):
         def _do():
@@ -714,20 +910,29 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
         raise ValueError("Choisissez une marque et un modele (ou un numero manuel).")
 
     def on_start():
-        try:
-            model_id = resolve_model_id()
-        except ValueError as e:
-            messagebox.showerror("Pont CAT OP0P", str(e))
-            return
-        port = port_var.get().strip()
-        if not port:
-            messagebox.showerror("Pont CAT OP0P", "Indiquez le port serie/COM de votre radio.")
-            return
-        try:
-            baud = int(baud_var.get().strip())
-        except ValueError:
-            messagebox.showerror("Pont CAT OP0P", "La vitesse (bauds) doit etre un nombre.")
-            return
+        using_commander = commander_var.get()
+
+        if using_commander:
+            try:
+                commander_host, commander_port = parse_commander_addr(commander_addr_var.get())
+            except ValueError as e:
+                messagebox.showerror("Pont CAT OP0P", str(e))
+                return
+        else:
+            try:
+                model_id = resolve_model_id()
+            except ValueError as e:
+                messagebox.showerror("Pont CAT OP0P", str(e))
+                return
+            port = port_var.get().strip()
+            if not port:
+                messagebox.showerror("Pont CAT OP0P", "Indiquez le port serie/COM de votre radio.")
+                return
+            try:
+                baud = int(baud_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Pont CAT OP0P", "La vitesse (bauds) doit etre un nombre.")
+                return
 
         lan = lan_var.get()
         pin = pin_var.get().strip()
@@ -741,64 +946,24 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
                 return
 
         save_config({
-            "mfg": mfg_var.get(), "model_label": model_var.get(), "port": port, "baud": baud,
+            "mfg": mfg_var.get(), "model_label": model_var.get(),
+            "port": port_var.get().strip(), "baud": baud_var.get().strip(),
             "lan": lan, "pin": pin,
+            "commander": using_commander, "commander_addr": commander_addr_var.get().strip(),
         })
 
-        rigctld_bin = find_rigctld_binary()
-        if not rigctld_bin:
-            messagebox.showerror(
-                "Pont CAT OP0P",
-                "Le programme 'rigctld' (fourni par Hamlib) est introuvable.\n\n"
-                "Installez Hamlib puis reessayez :\n"
-                "  Windows : https://github.com/Hamlib/Hamlib/releases/latest\n"
-                "  Debian/Ubuntu : sudo apt install libhamlib-utils\n"
-                "  Fedora : sudo dnf install hamlib\n"
-                "  macOS : brew install hamlib",
-            )
-            return
-
-        start_btn.configure(state="disabled")
-        set_status("Demarrage de rigctld...", "#b8860b")
-        log("Lancement : %s -m %d -r %s -s %d" % (rigctld_bin, model_id, port, baud))
-
-        try:
-            proc = subprocess.Popen(
-                [rigctld_bin, "-m", str(model_id), "-r", port, "-s", str(baud)],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                bufsize=1,
-            )
-        except Exception as e:
-            messagebox.showerror("Pont CAT OP0P", "Impossible de lancer rigctld : %s" % e)
-            start_btn.configure(state="normal")
-            set_status("Echec.", "#b00020")
-            return
-        state["rigctld_proc"] = proc
-
-        def read_rigctld_output():
-            if proc.stdout:
-                for line in proc.stdout:
-                    log("[rigctld] " + line.rstrip())
-        threading.Thread(target=read_rigctld_output, daemon=True).start()
-
-        def finish_start():
-            if proc.poll() is not None:
-                log("rigctld s'est arrete immediatement (code %s) - verifiez le port et le modele choisis."
-                    % proc.returncode)
-                set_status("Echec : rigctld ne demarre pas.", "#b00020")
-                start_btn.configure(state="normal")
-                return
-            if not wait_tcp_open(default_rigctld_host, default_rigctld_port, timeout_total=5.0):
-                log("rigctld ne repond pas sur %s:%d apres 5s." % (default_rigctld_host, default_rigctld_port))
-                set_status("Echec : rigctld ne repond pas.", "#b00020")
-                start_btn.configure(state="normal")
-                return
-
+        def start_bridge_server():
+            """Demarre le pont HTTP local (relais + /catbridge/tune) et
+            ouvre le navigateur - commun aux deux modes (Hamlib/rigctld ou
+            DXLab Commander), une fois que la radio/Commander est prete."""
             bind_host = "0.0.0.0" if lan else "127.0.0.1"
             try:
                 server = CatBridgeServer(
                     (bind_host, default_bridge_port), default_upstream,
                     default_rigctld_host, default_rigctld_port, pin=pin,
+                    commander=using_commander,
+                    commander_host=commander_host if using_commander else "127.0.0.1",
+                    commander_port=commander_port if using_commander else 52002,
                 )
             except OSError as e:
                 log("Impossible de demarrer le pont local : %s" % e)
@@ -852,6 +1017,75 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
                 set_status("Connecte - radio prete (" + local_url + ")", "#0a7d28")
             stop_btn.configure(state="normal")
 
+        if using_commander:
+            start_btn.configure(state="disabled")
+            set_status("Connexion a DXLab Commander...", "#b8860b")
+            log("Mode DXLab Commander : pas de rigctld - connexion a %s:%d."
+                % (commander_host, commander_port))
+
+            def finish_start_commander():
+                if not wait_tcp_open(commander_host, commander_port, timeout_total=4.0):
+                    log("Commander ne repond pas sur %s:%d apres 4s - verifiez que Commander "
+                        "tourne, et que son service reseau (Configuration > Radio > Net Serv) "
+                        "est bien demarre avec ce port." % (commander_host, commander_port))
+                    set_status("Echec : DXLab Commander ne repond pas.", "#b00020")
+                    start_btn.configure(state="normal")
+                    return
+                start_bridge_server()
+
+            threading.Thread(target=finish_start_commander, daemon=True).start()
+            return
+
+        rigctld_bin = find_rigctld_binary()
+        if not rigctld_bin:
+            messagebox.showerror(
+                "Pont CAT OP0P",
+                "Le programme 'rigctld' (fourni par Hamlib) est introuvable.\n\n"
+                "Installez Hamlib puis reessayez :\n"
+                "  Windows : https://github.com/Hamlib/Hamlib/releases/latest\n"
+                "  Debian/Ubuntu : sudo apt install libhamlib-utils\n"
+                "  Fedora : sudo dnf install hamlib\n"
+                "  macOS : brew install hamlib",
+            )
+            return
+
+        start_btn.configure(state="disabled")
+        set_status("Demarrage de rigctld...", "#b8860b")
+        log("Lancement : %s -m %d -r %s -s %d" % (rigctld_bin, model_id, port, baud))
+
+        try:
+            proc = subprocess.Popen(
+                [rigctld_bin, "-m", str(model_id), "-r", port, "-s", str(baud)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            messagebox.showerror("Pont CAT OP0P", "Impossible de lancer rigctld : %s" % e)
+            start_btn.configure(state="normal")
+            set_status("Echec.", "#b00020")
+            return
+        state["rigctld_proc"] = proc
+
+        def read_rigctld_output():
+            if proc.stdout:
+                for line in proc.stdout:
+                    log("[rigctld] " + line.rstrip())
+        threading.Thread(target=read_rigctld_output, daemon=True).start()
+
+        def finish_start():
+            if proc.poll() is not None:
+                log("rigctld s'est arrete immediatement (code %s) - verifiez le port et le modele choisis."
+                    % proc.returncode)
+                set_status("Echec : rigctld ne demarre pas.", "#b00020")
+                start_btn.configure(state="normal")
+                return
+            if not wait_tcp_open(default_rigctld_host, default_rigctld_port, timeout_total=5.0):
+                log("rigctld ne repond pas sur %s:%d apres 5s." % (default_rigctld_host, default_rigctld_port))
+                set_status("Echec : rigctld ne repond pas.", "#b00020")
+                start_btn.configure(state="normal")
+                return
+            start_bridge_server()
+
         threading.Thread(target=finish_start, daemon=True).start()
 
     def on_stop():
@@ -874,7 +1108,7 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
         stop_btn.configure(state="disabled")
 
     btn_frame = ttk.Frame(frm)
-    btn_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+    btn_frame.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(4, 4))
     start_btn = ttk.Button(btn_frame, text="Demarrer", command=on_start)
     start_btn.pack(side="left")
     stop_btn = ttk.Button(btn_frame, text="Arreter", command=on_stop, state="disabled")
@@ -885,8 +1119,9 @@ def run_gui(default_bridge_port, default_upstream, default_rigctld_host, default
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    _update_commander_state()
     log("Bienvenue. Choisissez votre radio et son port, puis cliquez sur Demarrer.")
-    log("(Hamlib/rigctld sera lance automatiquement pour vous.)")
+    log("(Hamlib/rigctld sera lance automatiquement pour vous, sauf en mode DXLab Commander.)")
     root.mainloop()
 
 
@@ -905,6 +1140,15 @@ def main():
     parser.add_argument("--pin", default=None,
                          help="code PIN optionnel exige en ?pin=... la premiere fois depuis chaque appareil "
                               "(fortement conseille avec --lan)")
+    parser.add_argument("--commander", action="store_true",
+                         help="pilote la radio via DXLab Suite Commander (interface reseau TCP) au lieu de "
+                              "Hamlib/rigctld - pour une radio deja pilotee par Commander (--rigctld-host/"
+                              "--rigctld-port sont alors ignores)")
+    parser.add_argument("--commander-host", default="127.0.0.1",
+                         help="adresse de DXLab Commander (defaut: 127.0.0.1)")
+    parser.add_argument("--commander-port", type=int, default=52002,
+                         help="port du service reseau de Commander (defaut: 52002 - voir le bouton "
+                              "'Net Serv' dans Commander)")
     args = parser.parse_args()
 
     want_gui = args.gui or (not args.no_gui and len(sys.argv) == 1)
@@ -920,7 +1164,8 @@ def main():
 
     bind_host = "0.0.0.0" if args.lan else "127.0.0.1"
     server = CatBridgeServer((bind_host, args.port), args.upstream, args.rigctld_host, args.rigctld_port,
-                              pin=args.pin)
+                              pin=args.pin, commander=args.commander,
+                              commander_host=args.commander_host, commander_port=args.commander_port)
 
     print("=" * 70)
     print(" Pont CAT OP0P pret (mode ligne de commande).")
@@ -938,8 +1183,13 @@ def main():
         if not args.pin:
             print(" ATTENTION: --lan sans --pin - n'importe quel appareil sur ce WiFi peut piloter la radio.")
     print()
-    print(" Verification : rigctld doit deja tourner sur %s:%d" %
-          (args.rigctld_host, args.rigctld_port))
+    if args.commander:
+        print(" Verification : DXLab Suite Commander doit deja tourner, avec son service reseau")
+        print(" (Configuration > Radio > Net Serv) actif sur %s:%d" %
+              (args.commander_host, args.commander_port))
+    else:
+        print(" Verification : rigctld doit deja tourner sur %s:%d" %
+              (args.rigctld_host, args.rigctld_port))
     print(" (sinon : voir les instructions sur cluster.op0p.be, page CAT)")
     print(" Ctrl+C pour arreter.")
     print("=" * 70)
