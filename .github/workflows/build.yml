@@ -1,0 +1,32 @@
+name: build-windows-exe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer PyInstaller
+        run: pip install pyinstaller
+
+      - name: Construire l'executable Windows
+        run: pyinstaller --onefile --windowed --name PontCAT-OP0P op0p_catbridge.py
+
+      - name: Publier une release avec l'exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Pont CAT OP0P - build ${{ github.run_number }}"
+          files: dist/PontCAT-OP0P.exe
