@@ -1,4 +1,4 @@
-# OP0P DXCluster_catbridge
+# OP0P DXCluster - op0p_catbridge
 
 Local CAT bridge for the [cluster.op0p.be](https://cluster.op0p.be) DX cluster
 (OP0P CC-Cluster): lets you click a frequency on the cluster - from a PC
@@ -16,6 +16,10 @@ See [cluster.op0p.be/releases](https://cluster.op0p.be/releases) for ready-to-us
 downloads (Windows standalone `.exe`, Windows `.pyw`, or the plain `.py` script
 for Linux/macOS), and [cluster.op0p.be/cat.html](https://cluster.op0p.be/cat.html)
 for full setup instructions (choosing your radio model and serial port).
+
+You will also need **Hamlib** installed once on the computer connected to the
+radio - see [HAMLIB.md](HAMLIB.md) for step-by-step install instructions
+(Windows/Linux/macOS).
 
 ## Controlling the radio from a phone or tablet (same WiFi network)
 
